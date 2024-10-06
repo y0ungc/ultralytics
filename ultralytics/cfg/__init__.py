@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Union
 
+import cv2
+
 from ultralytics.utils import (
     ASSETS,
     DEFAULT_CFG,
@@ -575,6 +577,45 @@ def handle_explorer(args: List[str]):
     subprocess.run(cmd)
 
 
+def handle_solutions(args: List[str]):
+    """
+    Run Ultralytics Solutions using Command Line Interface.
+    """
+    from ultralytics.utils.downloads import safe_download
+    SOLUTIONS = {"count", "heatmap", "queue"}
+    if args[0] not in SOLUTIONS:
+        raise ValueError(f"{args[0]} is not valid solution!, available solutions {SOLUTIONS}")
+
+    SOL_CFG_PATH = Path(__file__).resolve().parents[1] / "cfg/solutions/default.yaml"
+    SOL_CFG_DICT = yaml_load(SOL_CFG_PATH)
+    new = dict(parse_key_value_pair(a) for a in args[1:])
+    check_dict_alignment(base=SOL_CFG_DICT, custom=new)
+    SOL_CFG_DICT.update(new)
+    if SOL_CFG_DICT["source"] is None:
+        LOGGER.warning(f"WARNING ⚠️ source not provided! using default source video.")
+        MAJOR_SOLUTIONS_DEMO = "https://github.com/ultralytics/assets/releases/download/v0.0.0/solutions_ci_demo.mp4"
+        safe_download(url=MAJOR_SOLUTIONS_DEMO)
+        SOL_CFG_DICT["source"] = "solutions_ci_demo.mp4"
+
+    cap = cv2.VideoCapture(SOL_CFG_DICT["source"])
+    # Init Object Counter
+    from ultralytics import solutions
+    sol = solutions.ObjectCounter(
+        show=SOL_CFG_DICT["show"],
+        region=SOL_CFG_DICT["region"],
+        model=SOL_CFG_DICT["model"],
+    )
+    while cap.isOpened():
+        success, im0 = cap.read()
+        if not success:
+            print("Video frame is empty or video processing has been successfully completed.")
+            break
+        im0 = sol.count(im0)
+    cap.release()
+    video_writer.release()
+    cv2.destroyAllWindows()
+
+
 def handle_streamlit_inference():
     """
     Open the Ultralytics Live Inference Streamlit app for real-time object detection.
@@ -716,6 +757,7 @@ def entrypoint(debug=""):
         "copy-cfg": copy_default_cfg,
         "explorer": lambda: handle_explorer(args[1:]),
         "streamlit-predict": lambda: handle_streamlit_inference(),
+        "solutions": lambda: handle_solutions(args[1:])
     }
     full_args_dict = {**DEFAULT_CFG_DICT, **{k: None for k in TASKS}, **{k: None for k in MODES}, **special}
 

@@ -347,7 +347,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[2] *= self.hyp.cls  # cls gain
         loss[3] *= self.hyp.dfl  # dfl gain
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss.sum(), loss.detach()  # loss(box, cls, dfl)
 
     @staticmethod
     def single_mask_loss(
@@ -740,3 +740,88 @@ class E2EDetectLoss:
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
+class AttentionGuidedDistillationLoss(nn.Module):
+    def __init__(self, temperature=0.5):
+        super(AttentionGuidedDistillationLoss, self).__init__()
+        self.temperature = temperature
+
+    def spatial_attention(self, features):
+        """ 计算空间注意力 """
+        return torch.mean(torch.abs(features), dim=1, keepdim=True)
+
+    def channel_attention(self, features):
+        """ 计算通道注意力 """
+        return torch.mean(torch.abs(features), dim=(2, 3), keepdim=True)
+
+    def attention_map(self, teacher_features, student_features):
+        """ 计算归一化后的空间和通道注意力图 """
+        # 计算空间注意力和通道注意力
+        teacher_spatial_attention = self.spatial_attention(teacher_features)
+        student_spatial_attention = self.spatial_attention(student_features)
+        teacher_channel_attention = self.channel_attention(teacher_features)
+        student_channel_attention = self.channel_attention(student_features)
+
+        # 归一化注意力图
+        teacher_spatial_attention = F.softmax(teacher_spatial_attention / self.temperature, dim=-1)
+        student_spatial_attention = F.softmax(student_spatial_attention / self.temperature, dim=-1)
+        teacher_channel_attention = F.softmax(teacher_channel_attention / self.temperature, dim=-1)
+        student_channel_attention = F.softmax(student_channel_attention / self.temperature, dim=-1)
+
+        return teacher_spatial_attention, student_spatial_attention, teacher_channel_attention, student_channel_attention
+
+    def forward(self, teacher_features, student_features):
+        """ 计算attention-guided distillation loss """
+        # 计算教师和学生的注意力图
+        teacher_spatial_attention, student_spatial_attention, teacher_channel_attention, student_channel_attention = self.attention_map(teacher_features, student_features)
+
+        # 计算注意力传输损失 (LAT)
+        attention_transfer_loss = F.mse_loss(student_spatial_attention, teacher_spatial_attention) + \
+                                 F.mse_loss(student_channel_attention, teacher_channel_attention)
+
+        # 使用注意力掩码计算L2损失 (LAM)
+        spatial_mask = (teacher_spatial_attention + student_spatial_attention) / 2
+        channel_mask = (teacher_channel_attention + student_channel_attention) / 2
+        feature_loss = F.mse_loss(student_features * spatial_mask * channel_mask, teacher_features * spatial_mask * channel_mask)
+
+        # 总损失 = 注意力传输损失 + 特征蒸馏损失
+        total_loss = attention_transfer_loss + feature_loss
+        return total_loss
+
+class NonLocalDistillationLoss(nn.Module):
+    def __init__(self, in_channels):
+        super(NonLocalDistillationLoss, self).__init__()
+        # 非局部模块需要将输入特征映射到不同的通道
+        self.in_channels = in_channels
+        self.conv_theta = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1, stride=1, padding=0)
+        self.conv_phi = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1, stride=1, padding=0)
+        self.conv_g = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1, stride=1, padding=0)
+        self.conv_out = nn.Conv2d(in_channels // 2, in_channels, kernel_size=1, stride=1, padding=0)
+
+    def non_local_operation(self, x):
+        batch_size, channels, height, width = x.size()
+
+        # Compute theta, phi, g
+        theta = self.conv_theta(x).view(batch_size, channels // 2, -1)  # [B, C/2, H*W]
+        phi = self.conv_phi(x).view(batch_size, channels // 2, -1)  # [B, C/2, H*W]
+        g = self.conv_g(x).view(batch_size, channels // 2, -1)  # [B, C/2, H*W]
+
+        # Compute attention map (affinity matrix)
+        attention = torch.bmm(theta.permute(0, 2, 1), phi)  # [B, H*W, H*W]
+        attention = F.softmax(attention, dim=-1)  # Normalize attention map
+
+        # Apply attention to g
+        out = torch.bmm(g, attention.permute(0, 2, 1))  # [B, C/2, H*W]
+        out = out.view(batch_size, channels // 2, height, width)  # Reshape to original feature map size
+        out = self.conv_out(out)  # Restore to original channels
+
+        return out
+
+    def forward(self, teacher_feature, student_feature):
+        # 通过non-local模块捕获关系信息
+        teacher_relation = self.non_local_operation(teacher_feature)
+        student_relation = self.non_local_operation(student_feature)
+
+        # 计算L2范数损失
+        loss = F.mse_loss(student_relation, teacher_relation)
+        return loss

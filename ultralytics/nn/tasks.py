@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.modules import (
     AIFI,
@@ -67,6 +68,8 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    AttentionGuidedDistillationLoss,
+    NonLocalDistillationLoss
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
@@ -88,7 +91,6 @@ except ImportError:
 
 class BaseModel(nn.Module):
     """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
-
     def forward(self, x, *args, **kwargs):
         """
         Perform forward pass of the model for either training or inference.
@@ -385,6 +387,163 @@ class DetectionModel(BaseModel):
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
+        """Initialize the loss criterion for the DetectionModel."""
+        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+class SegmentationModel(DetectionModel):
+    """YOLOv8 segmentation model with distillation support."""
+    
+    def __init__(self, cfg="yolov8n-seg.yaml", ch=3, nc=None, verbose=True, teacher_model=None, distillation_alpha=0.5, temperature=3,feature_layers=None):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        self.teacher_model = teacher_model
+        self.ditillation_alpha = distillation_alpha
+        self.temperature = temperature
+        self.feature_layers = feature_layers  # 指定要进行特征蒸馏的层
+
+    def forward(self, x, *args, **kwargs):
+        if isinstance(x, dict):  # for cases of training and validating while training.
+            return self.loss(x, *args, **kwargs)
+        x,features = self.predict(x, *args, **kwargs)
+        return x
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        y, dt, embeddings = [], [], []  # outputs
+        features = []
+        for i, m in enumerate(self.model):
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            if i in self.feature_layers:
+                features.append(x)  # 存储中间特征
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if embed and m.i in embed:
+                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if m.i == max(embed):
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return x,features
+
+    def loss(self, batch, preds=None):
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        # 学生模型的预测输出
+        student_preds,student_features = self.forward(batch["img"]) if preds is None else preds
+
+        _, _, proto = student_preds if len(student_preds) == 3 else student_preds[1]
+        batch_size, _, _, _ = proto.shape  # batch size, number of masks, mask height, mask width
+
+        if self.teacher_model is None:
+            # 如果没有教师模型，只使用v8SegmentationLoss
+            return self.criterion(preds, batch)
+        else:
+            # 如果有教师模型，使用知识蒸馏损失
+            with torch.no_grad():
+                teacher_preds, teacher_features = self.teacher_model(batch["img"])
+            
+            # 计算输出蒸馏损失
+            output_loss = self.compute_output_distillation_loss(student_preds, teacher_preds)
+            
+            # 计算特征蒸馏损失
+            feature_loss = self.compute_feature_distillation_loss(student_features, teacher_features)
+            
+            # 计算总的蒸馏损失
+            distillation_loss = output_loss + feature_loss
+            
+            # 计算学生模型的原始损失
+            student_loss, student_loss_items = self.criterion(preds, batch)
+            
+            # 结合原始损失和蒸馏损失
+            loss = (1 - self.distillation_alpha) * student_loss + self.distillation_alpha * distillation_loss
+
+            # 创建一个新的损失项张量，包括原始损失项和蒸馏损失项
+            loss_items = torch.cat([student_loss_items, distillation_loss.detach().unsqueeze(0)])
+            
+        return loss * batch_size, loss_items
+
+    def compute_output_distillation_loss(self, student_preds, teacher_preds):
+        """
+        计算知识蒸馏损失，包括分类损失、边界框损失和掩码损失。
+
+        Args:
+            student_preds (tuple): 学生模型的输出，包含类别预测、边界框预测和掩码预测。
+            teacher_preds (tuple): 教师模型的输出，包含类别预测、边界框预测和掩码预测。
+
+        Returns:
+            torch.Tensor: 总的蒸馏损失，包括分类蒸馏损失、边界框蒸馏损失和掩码蒸馏损失。
+        """
+        # 学生模型的类别预测、边界框预测和掩码预测
+        student_cls_preds, student_bbox_preds, student_mask_preds = student_preds
+
+        # 教师模型的类别预测、边界框预测和掩码预测
+        with torch.no_grad():  # 教师模型不需要梯度
+            teacher_cls_preds, teacher_bbox_preds, teacher_mask_preds = teacher_preds
+
+        # 使用温度参数对教师模型和学生模型的输出进行软化
+        student_cls_soft = torch.nn.functional.softmax(student_cls_preds / self.temperature, dim=-1)
+        teacher_cls_soft = torch.nn.functional.softmax(teacher_cls_preds / self.temperature, dim=-1)
+
+        # 分类蒸馏损失（使用KL散度）
+        cls_distillation_loss = torch.nn.functional.kl_div(
+            torch.log(student_cls_soft), teacher_cls_soft, reduction="batchmean"
+        ) * (self.temperature ** 2)
+
+        # 边界框回归蒸馏损失（使用L1损失）
+        bbox_distillation_loss = torch.nn.functional.smooth_l1_loss(
+            student_bbox_preds, teacher_bbox_preds, reduction="mean"
+        )
+
+        # 掩码蒸馏损失（使用L1损失）
+        mask_distillation_loss = torch.nn.functional.smooth_l1_loss(
+            student_mask_preds, teacher_mask_preds, reduction="mean"
+        )
+
+        # 计算总的蒸馏损失，分别加权类别损失、边界框损失和掩码损失
+        total_distillation_loss = cls_distillation_loss + bbox_distillation_loss + mask_distillation_loss
+
+        return total_distillation_loss
+
+    def compute_feature_distillation_loss(self, student_features, teacher_features):
+        """
+        计算多个中间层特征的蒸馏损失，使用注意力引导和非局部蒸馏损失。
+        
+        Args:
+            student_features (list): 学生模型的多个中间层特征图列表
+            teacher_features (list): 教师模型的多个中间层特征图列表
+        
+        Returns:
+            torch.Tensor: 总的特征蒸馏损失
+        """
+        total_loss = 0
+        for sf_list, tf_list in zip(student_features, teacher_features):
+            layer_loss = 0
+            for sf, tf in zip(sf_list, tf_list):
+                # 确保特征图大小一致
+                if sf.size() != tf.size():
+                    tf = F.interpolate(tf, size=sf.size()[2:], mode='bilinear', align_corners=False)
+                
+                # 计算注意力引导蒸馏损失
+                agd_loss = AttentionGuidedDistillationLoss(self.temperature)(sf, tf)
+                
+                # 计算非局部蒸馏损失
+                in_channels = sf.size(1)
+                nld_loss = NonLocalDistillationLoss(in_channels)(sf, tf)
+                
+                # 累加当前层的损失
+                layer_loss += agd_loss + nld_loss
+            
+            # 将当前中间层的损失加到总损失中
+            total_loss += layer_loss
+
+        return total_loss
+    
+    def init_criterion(self):
+        """Initialize the loss criterion for the SegmentationModel."""
+        return v8SegmentationLoss(self)
+
 class OBBModel(DetectionModel):
     """YOLOv8 Oriented Bounding Box (OBB) model."""
 
@@ -395,19 +554,7 @@ class OBBModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the model."""
         return v8OBBLoss(self)
-
-
-class SegmentationModel(DetectionModel):
-    """YOLOv8 segmentation model."""
-
-    def __init__(self, cfg="yolov8n-seg.yaml", ch=3, nc=None, verbose=True):
-        """Initialize YOLOv8 segmentation model with given config and parameters."""
-        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-
-    def init_criterion(self):
-        """Initialize the loss criterion for the SegmentationModel."""
-        return v8SegmentationLoss(self)
-
+ 
 
 class PoseModel(DetectionModel):
     """YOLOv8 pose model."""
